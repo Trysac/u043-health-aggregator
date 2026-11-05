@@ -24,3 +24,12 @@ Measured values only; a value that has not been measured stays "pending measurem
 | Tokens (input / output) | pending measurement |
 | Hours (human) | pending measurement |
 | Cost (USD) | pending measurement |
+
+## Factory run u043 (measured from API usage)
+
+| Phase | Model | Batch | Input | Output | Cache write | Cache read | Cost (USD) |
+|---|---|---|---|---|---|---|---|
+| generation | claude-sonnet-5-5 | yes | 2085 | 45726 | 4017 | 0 | 0.2387 |
+| docs | claude-haiku-5-5 | no | 5305 | 5540 | 0 | 0 | 0.0033 |
+
+Total: $0.2420. Prices: Anthropic list prices.

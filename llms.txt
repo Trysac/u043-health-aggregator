@@ -1,7 +1,6 @@
 # health-aggregator
 
-> Aggregate dependency health checks concurrently with per-check timeouts, critical versus optional checks, a degraded state, caching and an HTTP handler Go module `github.com/Trysac/u043-health-aggregator`, package `healthaggregator`, MIT licensed,
-> Go >= 1.23, standard library only.
+> Concurrent dependency health checks with per-check timeouts, critical versus optional checks, an up/degraded/down status, TTL caching and an HTTP handler. Go module `github.com/Trysac/u043-health-aggregator`, package `health`, MIT licensed, Go >= 1.23, standard library only.
 
 ## Docs
 
