@@ -4,12 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/Trysac/u043-health-aggregator/actions/workflows/ci.yml/badge.svg)](https://github.com/Trysac/u043-health-aggregator/actions/workflows/ci.yml)
 
-Aggregate dependency health checks concurrently with per-check timeouts, critical versus optional checks, a degraded state, caching and an HTTP handler
+Concurrent dependency health checks with per-check timeouts, critical versus optional checks, an up/degraded/down status, TTL caching and an HTTP handler. Stdlib only.
 
 ## Problem
 
-Describe in two or three sentences the concrete problem this utility solves, who hits it, and what
-they do today without it. Replace this paragraph when the first real feature lands.
+Services often expose a health endpoint that either always reports ok, or fails the whole instance when a non-critical dependency such as a cache is slow. A hung check can also stall the probe itself. Kubernetes probes and load balancers need a fast, bounded answer that separates down from degraded without exposing internal error text, and teams currently hand-write sequential checks, timeouts and status logic for this.
 
 ## Install
 
@@ -22,25 +21,13 @@ Requires Go 1.23 or newer. No dependencies outside the standard library.
 ## Usage
 
 ```go
-package main
-
-import (
-	"errors"
-	"fmt"
-
-	"github.com/Trysac/u043-health-aggregator"
-)
-
-func main() {
-	// Normalize trims surrounding whitespace and lower-cases the text.
-	out, _ := healthaggregator.Normalize("  Hello World ")
-	fmt.Println(out) // -> "hello world"
-
-	// Blank input is rejected explicitly instead of returning an empty string.
-	if _, err := healthaggregator.Normalize("   "); errors.Is(err, healthaggregator.ErrBlank) {
-		fmt.Println("rejected:", err)
-	}
-}
+agg := health.New(health.Config{CacheTTL: 5 * time.Second})
+_ = agg.Register(health.Check{Name: "db", Critical: true, Fn: func(ctx context.Context) error { return nil }})
+_ = agg.Register(health.Check{Name: "cache", Fn: func(ctx context.Context) error { return nil }})
+report := agg.Run(context.Background())
+fmt.Println(report.Status) // up
+http.Handle("/readyz", agg.Handler())
+log.Fatal(http.ListenAndServe(":8080", nil))
 ```
 
 ## Documentation
