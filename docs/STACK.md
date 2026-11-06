@@ -18,5 +18,4 @@
 |---|---|
 | golangci-lint | Large external tool; `go vet` is enough for a small library. Revisit via ADR. |
 | testify | The standard `testing` package keeps the module dependency-free. |
-| golang.org/x/sync | Single flight is written with a local done channel, keeping the module dependency-free. |
 | Makefile / shell scripts for gates | Not portable to Windows; the gates are a stdlib Go program. |

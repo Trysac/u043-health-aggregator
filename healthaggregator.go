@@ -3,120 +3,122 @@ package healthaggregator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
+)
+
+// Status is the health state of one check or of a whole report.
+type Status string
+
+const (
+	// StatusUp means everything that was checked is healthy.
+	StatusUp Status = "up"
+
+	// StatusDegraded means only non-critical checks failed.
+	StatusDegraded Status = "degraded"
+
+	// StatusDown means a critical check failed, or the caller stopped waiting.
+	StatusDown Status = "down"
 )
 
 // MaxNameLength is the maximum length in bytes of a check name.
 const MaxNameLength = 64
 
-// MaxErrorLength is the maximum length in bytes of an error string exposed
-// when Config.ErrorDetails is true.
-const MaxErrorLength = 256
-
 // MaxChecks is the maximum number of checks one Aggregator accepts.
-const MaxChecks = 256
+const MaxChecks = 1024
 
-// DefaultCheckTimeout is the timeout used when neither the check nor the
-// Config specifies one.
-const DefaultCheckTimeout = 2 * time.Second
+// MaxErrorBytes is the maximum length in bytes of the error text of a check
+// result when ErrorDetails is enabled.
+const MaxErrorBytes = 256
 
-const failedMessage = "failed"
+const defaultTimeout = 2 * time.Second
 
-// Status is the health state of a check or of a whole report.
-type Status string
+const textFailed = "failed"
 
-// StatusUp means every check passed.
-const StatusUp Status = "up"
+const textInProgress = "previous run still in progress"
 
-// StatusDegraded means only non-critical checks failed.
-const StatusDegraded Status = "degraded"
+var errInProgress = errors.New(textInProgress)
 
-// StatusDown means at least one critical check failed.
-const StatusDown Status = "down"
-
-// Error is the base error type of this package. Every error returned by the
-// package is an *Error with a stable, machine-readable Code.
+// Error is the base error type of this package. Code is stable and
+// machine-readable; Message is short and never contains caller input.
 type Error struct {
-	// Code is a stable identifier such as "invalid_name".
+	// Code is a stable machine-readable identifier.
 	Code string
 
-	// Message is a short human-readable description. It never contains input.
+	// Message is a short human-readable description.
 	Message string
 }
 
 // Error implements the error interface.
-func (e *Error) Error() string {
-	return "healthaggregator: " + e.Message
-}
+func (e *Error) Error() string { return "healthaggregator: " + e.Message }
 
-// ErrDuplicateCheck is returned by Register when a name is already in use.
+// ErrDuplicateCheck is returned by Register when the name is already registered.
 var ErrDuplicateCheck = &Error{Code: "duplicate_check", Message: "a check with this name is already registered"}
 
-// ErrInvalidName is returned by Register for an empty name, a name longer
-// than MaxNameLength bytes or a name that is not valid UTF-8.
-var ErrInvalidName = &Error{Code: "invalid_name", Message: "check name must be 1 to 64 bytes of valid UTF-8"}
+// ErrInvalidName is returned by Register when the name is empty or longer than MaxNameLength bytes.
+var ErrInvalidName = &Error{Code: "invalid_name", Message: "check name must be 1 to 64 bytes"}
 
-// ErrInvalidCheck is returned by Register when the check function is nil.
-var ErrInvalidCheck = &Error{Code: "invalid_check", Message: "check function must not be nil"}
+// ErrNilFunc is returned by Register when the check has no Fn.
+var ErrNilFunc = &Error{Code: "nil_func", Message: "check function must not be nil"}
 
-// ErrTooManyChecks is returned by Register when MaxChecks is reached.
+// ErrTooManyChecks is returned by Register when MaxChecks checks are already registered.
 var ErrTooManyChecks = &Error{Code: "too_many_checks", Message: "too many checks registered"}
 
-// Check is a single dependency probe.
+// Check is one dependency probe.
+//
+// Fn must honour its context: a check that ignores it cannot be stopped and
+// leaks its goroutine until it returns on its own.
 type Check struct {
-	// Name identifies the check in reports. It must be unique per Aggregator.
+	// Name identifies the check; 1 to MaxNameLength bytes, unique per Aggregator.
 	Name string
 
-	// Fn performs the probe and returns nil when the dependency is healthy.
-	// It must honour ctx; a function that ignores ctx is reported as failed
-	// when the timeout fires but its goroutine lives until it returns.
+	// Fn runs the probe and returns nil when the dependency is healthy.
 	Fn func(ctx context.Context) error
 
-	// Timeout bounds the check. Zero or negative uses Config.DefaultTimeout.
+	// Timeout bounds one run; zero or negative uses Config.DefaultTimeout.
 	Timeout time.Duration
 
-	// Critical marks a check whose failure makes the report StatusDown.
-	// A failing non-critical check only degrades the report.
+	// Critical checks make the whole report down when they fail; failing
+	// non-critical checks only degrade it.
 	Critical bool
 }
 
 // Config configures an Aggregator. The zero value is usable.
 type Config struct {
-	// CacheTTL is how long a report is reused. Zero disables caching.
+	// CacheTTL is how long a report is reused; zero disables caching.
 	CacheTTL time.Duration
 
-	// DefaultTimeout applies to checks without a Timeout. Zero means 2s.
+	// DefaultTimeout applies to checks without a Timeout; 2s when zero.
 	DefaultTimeout time.Duration
 
-	// ErrorDetails exposes (truncated) error text in reports. It defaults to
-	// false because error strings can reveal hosts or credentials.
+	// ErrorDetails exposes error text (cut to MaxErrorBytes) in results.
+	// When false every failure is reported as "failed", because internal
+	// errors can reveal hosts or credentials.
 	ErrorDetails bool
 
-	// Now is the clock. It defaults to time.Now and must be safe for
-	// concurrent use.
+	// Now is the clock; time.Now when nil.
 	Now func() time.Time
 
-	// OnCheck, when set, is called once per executed check after the checks
-	// finish, outside any lock. A panic in the callback is recovered.
+	// OnCheck, when set, is called once per executed check, in name order,
+	// after the refresh result is published and outside every lock.
 	OnCheck func(CheckResult)
 }
 
-// Report is the aggregated outcome of one run.
+// Report is the aggregated outcome of one refresh.
 type Report struct {
-	// Status is the overall status.
+	// Status is the aggregated status.
 	Status Status `json:"status"`
 
-	// CheckedAt is when the run started.
+	// CheckedAt is when the refresh finished, in UTC.
 	CheckedAt time.Time `json:"checked_at"`
 
-	// Checks holds one result per check, sorted by name.
+	// Checks holds one result per registered check, sorted by name.
 	Checks []CheckResult `json:"checks"`
 }
 
@@ -128,14 +130,19 @@ type CheckResult struct {
 	// Status is StatusUp or StatusDown.
 	Status Status `json:"status"`
 
-	// DurationMS is the elapsed time in milliseconds on the injected clock.
+	// DurationMS is the run time in milliseconds.
 	DurationMS int64 `json:"duration_ms"`
 
-	// Error is "failed" or, with ErrorDetails, the truncated error text.
+	// Error is "failed" or, with ErrorDetails, the error text.
 	Error string `json:"error,omitempty"`
 
 	// Critical mirrors Check.Critical.
 	Critical bool `json:"critical"`
+}
+
+type entry struct {
+	check   Check
+	running atomic.Bool
 }
 
 type flight struct {
@@ -143,183 +150,132 @@ type flight struct {
 	report Report
 }
 
-type indexed struct {
-	i   int
-	res CheckResult
+type outcome struct {
+	index int
+	err   error
+	took  time.Duration
 }
 
-// Aggregator runs registered checks and aggregates their results. It is safe
-// for concurrent use.
+// Aggregator runs registered checks and aggregates them into a Report.
+// It is safe for concurrent use.
 type Aggregator struct {
 	cfg Config
 
 	mu       sync.Mutex
-	checks   []Check
-	names    map[string]struct{}
-	gen      uint64
-	cached   Report
-	cachedAt time.Time
-	hasCache bool
+	entries  []*entry
+	cached   *Report
 	inflight *flight
+	gen      uint64
 }
 
-// New returns an Aggregator using cfg with defaults applied.
+// New creates an Aggregator, applying defaults to cfg.
 func New(cfg Config) *Aggregator {
-	if cfg.DefaultTimeout <= 0 {
-		cfg.DefaultTimeout = DefaultCheckTimeout
-	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.DefaultTimeout <= 0 {
+		cfg.DefaultTimeout = defaultTimeout
 	}
 	if cfg.CacheTTL < 0 {
 		cfg.CacheTTL = 0
 	}
-	return &Aggregator{cfg: cfg, names: make(map[string]struct{})}
+	return &Aggregator{cfg: cfg}
 }
 
-// Register adds a check. It may be called after Run; doing so invalidates the
-// cached report. Errors are *Error values comparable with errors.Is.
+// Register adds a check and invalidates the cached report. It may be called
+// after Run; a refresh already in flight keeps its original set of checks.
 func (a *Aggregator) Register(c Check) error {
-	if c.Name == "" || len(c.Name) > MaxNameLength || !utf8.ValidString(c.Name) {
+	if n := len(c.Name); n == 0 || n > MaxNameLength {
 		return ErrInvalidName
 	}
 	if c.Fn == nil {
-		return ErrInvalidCheck
+		return ErrNilFunc
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if _, dup := a.names[c.Name]; dup {
+	idx := sort.Search(len(a.entries), func(i int) bool { return a.entries[i].check.Name >= c.Name })
+	if idx < len(a.entries) && a.entries[idx].check.Name == c.Name {
 		return ErrDuplicateCheck
 	}
-	if len(a.checks) >= MaxChecks {
+	if len(a.entries) >= MaxChecks {
 		return ErrTooManyChecks
 	}
-	a.checks = append(a.checks, c)
-	a.names[c.Name] = struct{}{}
+	next := make([]*entry, 0, len(a.entries)+1)
+	next = append(next, a.entries[:idx]...)
+	next = append(next, &entry{check: c})
+	next = append(next, a.entries[idx:]...)
+	a.entries = next
+	a.cached = nil
 	a.gen++
-	a.hasCache = false
-	a.cached = Report{}
 	return nil
 }
 
-// Run executes every check concurrently and returns the aggregated report.
-//
-// Fresh cached results are returned without running checks. Concurrent calls
-// during a refresh share that single execution. A run whose ctx ended before
-// completion is returned to its callers but never cached.
+// Run returns the current Report, refreshing it when the cache is empty or
+// expired. Concurrent callers share one refresh. The refresh is detached from
+// the cancellation of every caller; a caller whose ctx ends first receives a
+// synthesized, never cached, down report while the refresh carries on.
 func (a *Aggregator) Run(ctx context.Context) Report {
 	now := a.cfg.Now()
 	a.mu.Lock()
-	if a.cfg.CacheTTL > 0 && a.hasCache && now.Sub(a.cachedAt) < a.cfg.CacheTTL {
-		r := cloneReport(a.cached)
-		a.mu.Unlock()
-		return r
+	if c := a.cached; c != nil && a.cfg.CacheTTL > 0 {
+		if age := now.Sub(c.CheckedAt); age >= 0 && age < a.cfg.CacheTTL {
+			r := cloneReport(*c)
+			a.mu.Unlock()
+			return r
+		}
 	}
-	if f := a.inflight; f != nil {
-		a.mu.Unlock()
-		<-f.done
-		return cloneReport(f.report)
+	entries := a.entries
+	f := a.inflight
+	if f == nil {
+		f = &flight{done: make(chan struct{})}
+		a.inflight = f
+		go a.refresh(context.WithoutCancel(ctx), f, entries, a.gen)
 	}
-	f := &flight{done: make(chan struct{})}
-	a.inflight = f
-	checks := append([]Check(nil), a.checks...)
-	gen := a.gen
 	a.mu.Unlock()
 
-	report := a.execute(ctx, checks)
-
-	a.mu.Lock()
-	if ctx.Err() == nil && a.cfg.CacheTTL > 0 && a.gen == gen {
-		a.cached = cloneReport(report)
-		a.cachedAt = report.CheckedAt
-		a.hasCache = true
+	select {
+	case <-f.done:
+		return cloneReport(f.report)
+	case <-ctx.Done():
+		select {
+		case <-f.done:
+			return cloneReport(f.report)
+		default:
+		}
+		return a.abandoned(ctx.Err(), entries)
 	}
-	f.report = report
+}
+
+func (a *Aggregator) abandoned(err error, entries []*entry) Report {
+	text := a.errText(err)
+	checks := make([]CheckResult, len(entries))
+	for i, e := range entries {
+		checks[i] = CheckResult{Name: e.check.Name, Status: StatusDown, Error: text, Critical: e.check.Critical}
+	}
+	return Report{Status: StatusDown, CheckedAt: a.cfg.Now().UTC(), Checks: checks}
+}
+
+func (a *Aggregator) refresh(ctx context.Context, f *flight, entries []*entry, gen uint64) {
+	results, executed := a.execute(ctx, entries)
+	rep := Report{Status: aggregate(results), CheckedAt: a.cfg.Now().UTC(), Checks: results}
+	a.mu.Lock()
+	f.report = rep
+	if a.gen == gen && a.cfg.CacheTTL > 0 {
+		c := cloneReport(rep)
+		a.cached = &c
+	}
 	a.inflight = nil
 	a.mu.Unlock()
 	close(f.done)
-	return cloneReport(report)
-}
 
-func (a *Aggregator) execute(ctx context.Context, checks []Check) Report {
-	checkedAt := a.cfg.Now()
-	out := make(chan indexed, len(checks))
-	for i, c := range checks {
-		go a.runCheck(ctx, i, c, out)
+	if a.cfg.OnCheck == nil {
+		return
 	}
-	results := make([]CheckResult, len(checks))
-	for range checks {
-		r := <-out
-		results[r.i] = r.res
-	}
-	sort.Slice(results, func(i, j int) bool { return results[i].Name < results[j].Name })
-	status := aggregate(results)
-	if a.cfg.OnCheck != nil {
-		for _, r := range results {
+	for i, r := range results {
+		if executed[i] {
 			a.notify(r)
 		}
 	}
-	return Report{Status: status, CheckedAt: checkedAt, Checks: results}
-}
-
-func (a *Aggregator) runCheck(parent context.Context, idx int, c Check, out chan<- indexed) {
-	timeout := c.Timeout
-	if timeout <= 0 {
-		timeout = a.cfg.DefaultTimeout
-	}
-	ctx, cancel := context.WithTimeout(parent, timeout)
-	defer cancel()
-	start := a.cfg.Now()
-	err := runGuarded(ctx, c.Fn)
-	ms := a.cfg.Now().Sub(start).Milliseconds()
-	if ms < 0 {
-		ms = 0
-	}
-	res := CheckResult{Name: c.Name, Status: StatusUp, DurationMS: ms, Critical: c.Critical}
-	if err != nil {
-		res.Status = StatusDown
-		res.Error = a.describe(err)
-	}
-	out <- indexed{i: idx, res: res}
-}
-
-// runGuarded runs fn in its own goroutine, recovers panics and returns as soon
-// as fn finishes or ctx is done. A function ignoring ctx leaks only itself.
-func runGuarded(ctx context.Context, fn func(context.Context) error) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	done := make(chan error, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				done <- fmt.Errorf("panic: %v", r)
-			}
-		}()
-		done <- fn(ctx)
-	}()
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		select {
-		case err := <-done:
-			return err
-		default:
-			return ctx.Err()
-		}
-	}
-}
-
-func (a *Aggregator) describe(err error) string {
-	if !a.cfg.ErrorDetails {
-		return failedMessage
-	}
-	msg := truncateUTF8(strings.ToValidUTF8(err.Error(), "\uFFFD"), MaxErrorLength)
-	if msg == "" {
-		return failedMessage
-	}
-	return msg
 }
 
 func (a *Aggregator) notify(r CheckResult) {
@@ -327,12 +283,90 @@ func (a *Aggregator) notify(r CheckResult) {
 	a.cfg.OnCheck(r)
 }
 
-// truncateUTF8 cuts s to at most limit bytes on a rune boundary.
-func truncateUTF8(s string, limit int) string {
-	if len(s) <= limit {
+func (a *Aggregator) execute(ctx context.Context, entries []*entry) ([]CheckResult, []bool) {
+	results := make([]CheckResult, len(entries))
+	executed := make([]bool, len(entries))
+	out := make(chan outcome, len(entries))
+	pending := 0
+	for i, e := range entries {
+		results[i] = CheckResult{Name: e.check.Name, Critical: e.check.Critical}
+		if !e.running.CompareAndSwap(false, true) {
+			results[i].Status = StatusDown
+			results[i].Error = a.errText(errInProgress)
+			continue
+		}
+		executed[i] = true
+		pending++
+		go a.runOne(ctx, i, e, out)
+	}
+	for ; pending > 0; pending-- {
+		o := <-out
+		r := &results[o.index]
+		r.DurationMS = o.took.Milliseconds()
+		if o.err != nil {
+			r.Status = StatusDown
+			r.Error = a.errText(o.err)
+		} else {
+			r.Status = StatusUp
+		}
+	}
+	return results, executed
+}
+
+func (a *Aggregator) runOne(ctx context.Context, index int, e *entry, out chan<- outcome) {
+	start := a.cfg.Now()
+	timeout := e.check.Timeout
+	if timeout <= 0 {
+		timeout = a.cfg.DefaultTimeout
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		err := call(cctx, e.check.Fn)
+		e.running.Store(false)
+		done <- err
+	}()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-cctx.Done():
+		select {
+		case err = <-done:
+		default:
+			err = cctx.Err()
+		}
+	}
+	took := a.cfg.Now().Sub(start)
+	if took < 0 {
+		took = 0
+	}
+	out <- outcome{index: index, err: err, took: took}
+}
+
+func call(ctx context.Context, fn func(context.Context) error) (err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = fmt.Errorf("panic: %v", v)
+		}
+	}()
+	return fn(ctx)
+}
+
+func (a *Aggregator) errText(err error) string {
+	if !a.cfg.ErrorDetails {
+		return textFailed
+	}
+	return truncate(err.Error())
+}
+
+func truncate(s string) string {
+	if len(s) <= MaxErrorBytes {
 		return s
 	}
-	cut := limit
+	cut := MaxErrorBytes
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
@@ -342,7 +376,7 @@ func truncateUTF8(s string, limit int) string {
 func aggregate(results []CheckResult) Status {
 	status := StatusUp
 	for _, r := range results {
-		if r.Status == StatusUp {
+		if r.Status != StatusDown {
 			continue
 		}
 		if r.Critical {
@@ -354,40 +388,36 @@ func aggregate(results []CheckResult) Status {
 }
 
 func cloneReport(r Report) Report {
-	r.Checks = append([]CheckResult{}, r.Checks...)
+	checks := make([]CheckResult, len(r.Checks))
+	copy(checks, r.Checks)
+	r.Checks = checks
 	return r
 }
 
-// Handler returns an http.Handler serving the report as JSON.
-//
-// GET and HEAD answer 200 for up and degraded and 503 for down, with
-// Content-Type application/json and Cache-Control no-store. HEAD sends no
-// body. Other methods get 405 with Allow: GET, HEAD. The request context is
-// used for the run; stack traces are never included.
+// Handler returns an http.Handler serving the report as JSON. GET and HEAD
+// answer 200 for up and degraded and 503 for down; other methods get 405.
+// With ErrorDetails disabled only names, statuses and durations (plus the
+// generic text "failed") are exposed.
 func (a *Aggregator) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Cache-Control", "no-store")
+		h.Set("X-Content-Type-Options", "nosniff")
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			w.Header().Set("Allow", "GET, HEAD")
+			h.Set("Allow", "GET, HEAD")
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		report := a.Run(r.Context())
-		body, err := json.Marshal(report)
-		if err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-		h := w.Header()
+		rep := a.Run(r.Context())
 		h.Set("Content-Type", "application/json")
-		h.Set("Cache-Control", "no-store")
-		h.Set("Content-Length", strconv.Itoa(len(body)))
 		code := http.StatusOK
-		if report.Status == StatusDown {
+		if rep.Status == StatusDown {
 			code = http.StatusServiceUnavailable
 		}
 		w.WriteHeader(code)
-		if r.Method == http.MethodGet {
-			_, _ = w.Write(body)
+		if r.Method == http.MethodHead {
+			return
 		}
+		_ = json.NewEncoder(w).Encode(rep)
 	})
 }

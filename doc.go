@@ -1,34 +1,38 @@
-// Package healthaggregator aggregates dependency health checks.
+// Package healthaggregator runs dependency health checks concurrently, with a
+// timeout per check, and aggregates them into a Report whose status is up,
+// degraded or down.
 //
-// An Aggregator runs registered checks concurrently, each with its own
-// timeout, and combines the results into a Report whose status is up,
-// degraded or down. A failing critical check makes the report down; a failing
-// non-critical check only degrades it. Reports can be cached for a TTL and
-// served over HTTP with Aggregator.Handler.
+// A failing critical check makes the report down; a failing non-critical check
+// only makes it degraded. Reports can be cached for a TTL, concurrent callers
+// share a single refresh, and Handler serves the report as JSON for
+// Kubernetes probes and load balancers.
 //
 // # Liveness versus readiness
 //
-// Liveness answers "is the process alive" and should not depend on external
-// systems; readiness answers "can the process serve traffic" and may check
-// databases and caches. Use two aggregators: an empty one (or one with only
-// in-process checks) for liveness, and one with dependency checks for
-// readiness. Mount them on separate paths.
+// Use two aggregators. A liveness aggregator should hold no external
+// dependencies (or none at all), so a slow database never gets a pod killed.
+// A readiness aggregator holds the dependencies, marking the ones the service
+// cannot work without as Critical and the rest as optional, so they only
+// degrade the answer. Mount them on different paths, for example /livez and
+// /readyz.
 //
-// # Execution model
+// # Checks must honour their context
 //
-// Every check runs in its own goroutine under a context with a deadline and
-// reports on a buffered channel, so a check that never returns cannot block
-// the run. Checks must honour their context: a check that ignores it is
-// reported as failed when the deadline passes, but its goroutine stays alive
-// until the function returns. Panics inside checks are recovered and reported
-// as failures.
+// Every check runs in its own goroutine under a context with a timeout. The
+// aggregator stops waiting when the timeout expires and reports the check as
+// down, but it cannot stop a function that ignores its context: that goroutine
+// leaks until the function returns. To bound the damage, at most one invocation
+// of each check is in flight; while it is still running the check is reported
+// down with "previous run still in progress" and is not started again.
 //
 // # Threat note
 //
-// Error strings returned by checks can reveal host names, addresses or
-// credentials. By default a failed check is reported only as "failed". With
-// Config.ErrorDetails enabled, error text is cut to 256 bytes on a UTF-8
-// boundary; enable it only on endpoints that are not publicly reachable.
-// Check names are limited to 64 bytes, at most 256 checks can be registered
-// and stack traces are never emitted.
+// Health endpoints are often unauthenticated. Error text from dependencies can
+// reveal hosts, ports or credentials, so it is hidden by default: with
+// Config.ErrorDetails false every failure is reported as "failed". Enable
+// ErrorDetails only on endpoints that are not reachable by untrusted callers.
+// Error text is cut to 256 bytes on a rune boundary, names are limited to 64
+// bytes, at most 1024 checks can be registered, and the handler never emits
+// stack traces. A shared refresh is never cancelled by one caller: a caller
+// that gives up receives a synthesized down report that is not cached.
 package healthaggregator

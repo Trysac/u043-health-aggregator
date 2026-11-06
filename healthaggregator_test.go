@@ -2,12 +2,10 @@ package healthaggregator_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,23 +13,21 @@ import (
 	"time"
 	"unicode/utf8"
 
-	healthaggregator "github.com/Trysac/u043-health-aggregator"
+	"github.com/Trysac/u043-health-aggregator"
 )
 
 type check = healthaggregator.Check
 
 type config = healthaggregator.Config
 
-var bg = context.Background()
+var epoch = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 
 type fakeClock struct {
 	mu  sync.Mutex
 	now time.Time
 }
 
-func newClock() *fakeClock {
-	return &fakeClock{now: time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)}
-}
+func newClock() *fakeClock { return &fakeClock{now: epoch} }
 
 func (c *fakeClock) Now() time.Time {
 	c.mu.Lock()
@@ -47,572 +43,564 @@ func (c *fakeClock) Advance(d time.Duration) {
 
 func pass(context.Context) error { return nil }
 
-func fail(context.Context) error { return errors.New("boom") }
-
-func counting(n *int32, err error) func(context.Context) error {
-	return func(context.Context) error {
-		atomic.AddInt32(n, 1)
-		return err
-	}
+func failWith(msg string) func(context.Context) error {
+	return func(context.Context) error { return errors.New(msg) }
 }
 
-func register(t *testing.T, a *healthaggregator.Aggregator, checks ...check) {
+func newAgg(t *testing.T, cfg config, checks ...check) *healthaggregator.Aggregator {
 	t.Helper()
+	if cfg.Now == nil {
+		cfg.Now = newClock().Now
+	}
+	a := healthaggregator.New(cfg)
 	for _, c := range checks {
 		if err := a.Register(c); err != nil {
 			t.Fatalf("Register(%q) = %v", c.Name, err)
 		}
 	}
+	return a
 }
 
-func serve(a *healthaggregator.Aggregator, method string) *httptest.ResponseRecorder {
-	rec := httptest.NewRecorder()
-	a.Handler().ServeHTTP(rec, httptest.NewRequest(method, "/health", nil))
-	return rec
-}
-
-func keys(m map[string]any) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
+func blocker(t *testing.T, calls *atomic.Int32) func(context.Context) error {
+	t.Helper()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	return func(context.Context) error {
+		calls.Add(1)
+		<-release
+		return nil
 	}
-	slices.Sort(out)
-	return out
 }
 
-func TestRunStatus(t *testing.T) {
+func TestStatusAggregation(t *testing.T) {
 	tests := []struct {
 		name   string
 		checks []check
 		want   healthaggregator.Status
 	}{
-		{name: "no checks", want: healthaggregator.StatusUp},
-		{name: "all pass", checks: []check{{Name: "a", Fn: pass, Critical: true}, {Name: "b", Fn: pass}}, want: healthaggregator.StatusUp},
-		{name: "optional fails", checks: []check{{Name: "db", Fn: pass, Critical: true}, {Name: "cache", Fn: fail}}, want: healthaggregator.StatusDegraded},
-		{name: "critical fails", checks: []check{{Name: "db", Fn: fail, Critical: true}, {Name: "cache", Fn: pass}}, want: healthaggregator.StatusDown},
-		{name: "both fail", checks: []check{{Name: "db", Fn: fail, Critical: true}, {Name: "cache", Fn: fail}}, want: healthaggregator.StatusDown},
+		{name: "all pass", checks: []check{{Name: "db", Fn: pass, Critical: true}, {Name: "cache", Fn: pass}}, want: healthaggregator.StatusUp},
+		{name: "only optional fails", checks: []check{{Name: "db", Fn: pass, Critical: true}, {Name: "cache", Fn: failWith("x")}}, want: healthaggregator.StatusDegraded},
+		{name: "critical fails", checks: []check{{Name: "db", Fn: failWith("x"), Critical: true}, {Name: "cache", Fn: pass}}, want: healthaggregator.StatusDown},
+		{name: "critical and optional fail", checks: []check{{Name: "db", Fn: failWith("x"), Critical: true}, {Name: "cache", Fn: failWith("y")}}, want: healthaggregator.StatusDown},
+		{name: "zero checks", checks: nil, want: healthaggregator.StatusUp},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			a := healthaggregator.New(config{})
-			register(t, a, tt.checks...)
-			got := a.Run(bg)
-			if got.Status != tt.want {
-				t.Fatalf("Status = %q, want %q", got.Status, tt.want)
+			a := newAgg(t, config{}, tt.checks...)
+			rep := a.Run(context.Background())
+			if rep.Status != tt.want {
+				t.Fatalf("Status = %q, want %q", rep.Status, tt.want)
 			}
-			if got.Checks == nil {
-				t.Fatal("Checks must not be nil")
-			}
-			if len(got.Checks) != len(tt.checks) {
-				t.Fatalf("len(Checks) = %d, want %d", len(got.Checks), len(tt.checks))
+			if rep.Checks == nil || len(rep.Checks) != len(tt.checks) {
+				t.Fatalf("Checks = %v, want %d entries and non-nil", rep.Checks, len(tt.checks))
 			}
 		})
 	}
 }
 
-func TestRunSortsByName(t *testing.T) {
-	a := healthaggregator.New(config{})
-	for _, name := range []string{"zeta", "alpha", "émile", "Beta"} {
-		register(t, a, check{Name: name, Fn: pass})
+func TestChecksSortedAndUTC(t *testing.T) {
+	zone := time.FixedZone("plus2", 2*60*60)
+	now := func() time.Time { return epoch.In(zone) }
+	a := newAgg(t, config{Now: now}, check{Name: "zeta", Fn: pass}, check{Name: "alpha", Fn: pass}, check{Name: "mid", Fn: pass})
+	rep := a.Run(context.Background())
+	names := make([]string, 0, len(rep.Checks))
+	for _, c := range rep.Checks {
+		names = append(names, c.Name)
 	}
-	var got []string
-	for _, c := range a.Run(bg).Checks {
-		got = append(got, c.Name)
+	if got := strings.Join(names, ","); got != "alpha,mid,zeta" {
+		t.Fatalf("names = %q, want alpha,mid,zeta", got)
 	}
-	want := []string{"Beta", "alpha", "zeta", "émile"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("order = %v, want %v", got, want)
+	if rep.CheckedAt.Location() != time.UTC {
+		t.Fatalf("CheckedAt location = %v, want UTC", rep.CheckedAt.Location())
 	}
-}
-
-func TestHungCheckIsReportedFailed(t *testing.T) {
-	release := make(chan struct{})
-	defer close(release)
-	hung := func(context.Context) error {
-		<-release
-		return nil
-	}
-	a := healthaggregator.New(config{ErrorDetails: true})
-	register(t, a, check{Name: "hung", Fn: hung, Timeout: 20 * time.Millisecond, Critical: true})
-	begin := time.Now()
-	got := a.Run(bg)
-	if elapsed := time.Since(begin); elapsed > 2*time.Second {
-		t.Fatalf("Run took %v", elapsed)
-	}
-	if got.Status != healthaggregator.StatusDown {
-		t.Fatalf("Status = %q, want down", got.Status)
-	}
-	if got.Checks[0].Error != "context deadline exceeded" {
-		t.Fatalf("Error = %q", got.Checks[0].Error)
+	if !rep.CheckedAt.Equal(epoch) {
+		t.Fatalf("CheckedAt = %v, want %v", rep.CheckedAt, epoch)
 	}
 }
 
-func TestErrorDetails(t *testing.T) {
-	long := "x" + strings.Repeat("é", 200)
+func TestTimeoutWithIgnoredContext(t *testing.T) {
+	var calls atomic.Int32
+	a := newAgg(t, config{ErrorDetails: true}, check{Name: "slow", Fn: blocker(t, &calls), Timeout: 20 * time.Millisecond, Critical: true})
+	start := time.Now()
+	rep := a.Run(context.Background())
+	if elapsed := time.Since(start); elapsed >= 2*time.Second {
+		t.Fatalf("Run took %v, want under 2s", elapsed)
+	}
+	if rep.Status != healthaggregator.StatusDown {
+		t.Fatalf("Status = %q, want down", rep.Status)
+	}
+	got := rep.Checks[0]
+	if got.Status != healthaggregator.StatusDown || got.Error != "context deadline exceeded" {
+		t.Fatalf("result = %+v, want down with context deadline exceeded", got)
+	}
+	again := a.Run(context.Background())
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("Fn called %d times, want 1", n)
+	}
+	if again.Checks[0].Error != "previous run still in progress" || again.Status != healthaggregator.StatusDown {
+		t.Fatalf("second result = %+v (status %q), want previous run still in progress", again.Checks[0], again.Status)
+	}
+}
+
+func TestFailuresHiddenByDefault(t *testing.T) {
+	var calls atomic.Int32
+	a := newAgg(t, config{}, check{Name: "a-fail", Fn: failWith("dial tcp 10.0.0.5:5432: refused")}, check{Name: "b-slow", Fn: blocker(t, &calls), Timeout: 20 * time.Millisecond})
+	for run := 0; run < 2; run++ {
+		rep := a.Run(context.Background())
+		for _, c := range rep.Checks {
+			if c.Status != healthaggregator.StatusDown || c.Error != "failed" {
+				t.Fatalf("run %d: result = %+v, want down with Error failed", run, c)
+			}
+		}
+	}
+}
+
+func TestErrorTruncation(t *testing.T) {
 	tests := []struct {
 		name    string
-		details bool
-		err     error
-		want    string
+		message string
+		wantLen int
 	}{
-		{name: "hidden by default", details: false, err: errors.New("boom"), want: "failed"},
-		{name: "shown", details: true, err: errors.New("boom"), want: "boom"},
-		{name: "empty message", details: true, err: errors.New(""), want: "failed"},
-		{name: "invalid utf8", details: true, err: errors.New("a\xffb"), want: "a\uFFFDb"},
-		{name: "multi-byte truncation", details: true, err: errors.New(long), want: "x" + strings.Repeat("é", 127)},
-		{name: "ascii truncation", details: true, err: errors.New(strings.Repeat("a", 300)), want: strings.Repeat("a", 256)},
+		{name: "multi-byte text cut on a rune boundary", message: "a" + strings.Repeat("\u00e9", 200), wantLen: 255},
+		{name: "ascii cut at the limit", message: strings.Repeat("x", 300), wantLen: 256},
+		{name: "exactly at the limit is kept", message: strings.Repeat("x", 256), wantLen: 256},
+		{name: "short message is kept", message: "boom", wantLen: 4},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			a := healthaggregator.New(config{ErrorDetails: tt.details})
-			fn := func(context.Context) error { return tt.err }
-			register(t, a, check{Name: "c", Fn: fn})
-			got := a.Run(bg).Checks[0].Error
-			if got != tt.want {
-				t.Fatalf("Error = %q, want %q", got, tt.want)
+			a := newAgg(t, config{ErrorDetails: true}, check{Name: "c", Fn: failWith(tt.message)})
+			got := a.Run(context.Background()).Checks[0].Error
+			if len(got) != tt.wantLen {
+				t.Fatalf("len(Error) = %d, want %d", len(got), tt.wantLen)
 			}
-			if !utf8.ValidString(got) || len(got) > healthaggregator.MaxErrorLength {
-				t.Fatalf("Error is invalid or too long: %d bytes", len(got))
+			if !utf8.ValidString(got) || !strings.HasPrefix(tt.message, got) {
+				t.Fatalf("Error %q is not a valid prefix of the message", got)
 			}
 		})
 	}
 }
 
 func TestPanicIsRecovered(t *testing.T) {
-	var calls int32
+	var calls atomic.Int32
 	fn := func(context.Context) error {
-		if atomic.AddInt32(&calls, 1) == 1 {
-			panic("kaboom")
+		if calls.Add(1) == 1 {
+			panic("boom")
 		}
 		return nil
 	}
-	a := healthaggregator.New(config{ErrorDetails: true})
-	register(t, a, check{Name: "p", Fn: fn, Critical: true})
-	first := a.Run(bg)
-	if first.Status != healthaggregator.StatusDown || first.Checks[0].Error != "panic: kaboom" {
-		t.Fatalf("first = %+v", first)
+	a := newAgg(t, config{ErrorDetails: true}, check{Name: "p", Fn: fn, Critical: true})
+	rep := a.Run(context.Background())
+	if rep.Status != healthaggregator.StatusDown || rep.Checks[0].Error != "panic: boom" {
+		t.Fatalf("report = %+v, want down with panic: boom", rep)
 	}
-	if second := a.Run(bg); second.Status != healthaggregator.StatusUp {
-		t.Fatalf("second = %+v", second)
+	if next := a.Run(context.Background()); next.Status != healthaggregator.StatusUp {
+		t.Fatalf("next Status = %q, want up", next.Status)
 	}
 
-	hidden := healthaggregator.New(config{})
-	panicking := func(context.Context) error { panic("secret") }
-	register(t, hidden, check{Name: "p", Fn: panicking})
-	if got := hidden.Run(bg).Checks[0].Error; got != "failed" {
-		t.Fatalf("Error = %q, want failed", got)
+	hidden := newAgg(t, config{}, check{Name: "p", Fn: func(context.Context) error { panic("boom") }})
+	if got := hidden.Run(context.Background()).Checks[0].Error; got != "failed" {
+		t.Fatalf("hidden panic Error = %q, want failed", got)
 	}
 }
 
-func TestCacheReusesResultsWithinTTL(t *testing.T) {
-	clk := newClock()
-	var calls int32
-	a := healthaggregator.New(config{CacheTTL: 10 * time.Second, Now: clk.Now})
-	register(t, a, check{Name: "db", Fn: counting(&calls, nil)})
-	first := a.Run(bg)
-	first.Checks[0].Name = "mutated"
-	second := a.Run(bg)
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("calls = %d, want 1", got)
+func TestCheckHonoursContext(t *testing.T) {
+	fn := func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
 	}
-	if second.Checks[0].Name != "db" {
-		t.Fatalf("cached report was mutated: %q", second.Checks[0].Name)
-	}
-	clk.Advance(11 * time.Second)
-	a.Run(bg)
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Fatalf("calls = %d, want 2", got)
+	a := newAgg(t, config{ErrorDetails: true}, check{Name: "c", Fn: fn, Timeout: 20 * time.Millisecond})
+	if got := a.Run(context.Background()).Checks[0].Error; got != "context deadline exceeded" {
+		t.Fatalf("Error = %q, want context deadline exceeded", got)
 	}
 }
 
-func TestCancelledRunIsNotCached(t *testing.T) {
-	clk := newClock()
-	var calls int32
-	a := healthaggregator.New(config{CacheTTL: time.Hour, Now: clk.Now})
-	register(t, a, check{Name: "db", Fn: counting(&calls, nil)})
-	ctx, cancel := context.WithCancel(bg)
-	cancel()
-	if got := a.Run(ctx); got.Status != healthaggregator.StatusUp && got.Checks[0].Status != healthaggregator.StatusDown {
-		t.Fatalf("unexpected report %+v", got)
-	}
-	if got := atomic.LoadInt32(&calls); got != 0 {
-		t.Fatalf("calls = %d, want 0", got)
-	}
-	if got := a.Run(bg); got.Status != healthaggregator.StatusUp {
-		t.Fatalf("Status = %q, want up", got.Status)
-	}
-	a.Run(bg)
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("calls = %d, want 1", got)
+func TestDefaultTimeoutApplies(t *testing.T) {
+	var calls atomic.Int32
+	a := newAgg(t, config{DefaultTimeout: 20 * time.Millisecond, ErrorDetails: true}, check{Name: "c", Fn: blocker(t, &calls)})
+	start := time.Now()
+	rep := a.Run(context.Background())
+	if time.Since(start) >= 2*time.Second || rep.Checks[0].Error != "context deadline exceeded" {
+		t.Fatalf("result = %+v, want a quick deadline exceeded", rep.Checks[0])
 	}
 }
 
-func TestRegisterAfterRunInvalidatesCache(t *testing.T) {
+func TestCacheTTL(t *testing.T) {
 	clk := newClock()
-	var calls int32
-	a := healthaggregator.New(config{CacheTTL: time.Hour, Now: clk.Now})
-	register(t, a, check{Name: "a", Fn: counting(&calls, nil)})
-	a.Run(bg)
-	register(t, a, check{Name: "b", Fn: pass})
-	got := a.Run(bg)
-	if len(got.Checks) != 2 {
-		t.Fatalf("len(Checks) = %d, want 2", len(got.Checks))
+	var calls atomic.Int32
+	fn := func(context.Context) error {
+		calls.Add(1)
+		return nil
 	}
-	if n := atomic.LoadInt32(&calls); n != 2 {
+	a := newAgg(t, config{CacheTTL: 10 * time.Second, Now: clk.Now}, check{Name: "db", Fn: fn})
+	a.Run(context.Background())
+	a.Run(context.Background())
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("calls = %d, want 1", n)
+	}
+	clk.Advance(9 * time.Second)
+	a.Run(context.Background())
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("calls after 9s = %d, want 1", n)
+	}
+	clk.Advance(time.Second)
+	a.Run(context.Background())
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("calls after 10s = %d, want 2", n)
+	}
+	clk.Advance(-time.Minute)
+	a.Run(context.Background())
+	if n := calls.Load(); n != 3 {
+		t.Fatalf("calls after the clock moved backwards = %d, want 3", n)
+	}
+}
+
+func TestCacheDisabled(t *testing.T) {
+	var calls atomic.Int32
+	fn := func(context.Context) error {
+		calls.Add(1)
+		return nil
+	}
+	a := newAgg(t, config{CacheTTL: -time.Second}, check{Name: "db", Fn: fn})
+	a.Run(context.Background())
+	a.Run(context.Background())
+	if n := calls.Load(); n != 2 {
 		t.Fatalf("calls = %d, want 2", n)
 	}
 }
 
-func TestConcurrentRunsShareOneExecution(t *testing.T) {
-	clk := newClock()
-	started := make(chan struct{}, 1)
-	release := make(chan struct{})
-	var calls int32
-	slow := func(context.Context) error {
-		atomic.AddInt32(&calls, 1)
-		select {
-		case started <- struct{}{}:
-		default:
+func TestRegisterInvalidatesCache(t *testing.T) {
+	var first, second atomic.Int32
+	count := func(n *atomic.Int32) func(context.Context) error {
+		return func(context.Context) error {
+			n.Add(1)
+			return nil
 		}
+	}
+	a := newAgg(t, config{CacheTTL: 10 * time.Second}, check{Name: "a", Fn: count(&first)})
+	a.Run(context.Background())
+	if err := a.Register(check{Name: "b", Fn: count(&second)}); err != nil {
+		t.Fatalf("Register = %v", err)
+	}
+	rep := a.Run(context.Background())
+	if len(rep.Checks) != 2 || second.Load() != 1 || first.Load() != 2 {
+		t.Fatalf("checks=%d first=%d second=%d, want 2, 2, 1", len(rep.Checks), first.Load(), second.Load())
+	}
+}
+
+func TestReportIsolation(t *testing.T) {
+	a := newAgg(t, config{CacheTTL: time.Hour}, check{Name: "db", Fn: pass})
+	rep := a.Run(context.Background())
+	rep.Checks[0].Name = "mutated"
+	if got := a.Run(context.Background()).Checks[0].Name; got != "db" {
+		t.Fatalf("cached Name = %q, want db", got)
+	}
+}
+
+func TestConcurrentRunsShareRefreshAndSurviveCancel(t *testing.T) {
+	var calls atomic.Int32
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	fn := func(context.Context) error {
+		calls.Add(1)
+		started <- struct{}{}
 		<-release
 		return nil
 	}
-	a := healthaggregator.New(config{CacheTTL: time.Hour, Now: clk.Now})
-	register(t, a, check{Name: "slow", Fn: slow})
-	const callers = 8
-	reports := make([]healthaggregator.Report, callers)
-	var wg sync.WaitGroup
-	for i := range callers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			reports[i] = a.Run(bg)
-		}()
-	}
+	a := newAgg(t, config{CacheTTL: 10 * time.Second, ErrorDetails: true}, check{Name: "db", Fn: fn, Critical: true})
+
+	ctxA, cancelA := context.WithCancel(context.Background())
+	repA := make(chan healthaggregator.Report, 1)
+	repB := make(chan healthaggregator.Report, 1)
+	go func() { repA <- a.Run(ctxA) }()
 	<-started
+	go func() { repB <- a.Run(context.Background()) }()
+	cancelA()
+
+	select {
+	case r := <-repA:
+		if r.Status != healthaggregator.StatusDown || r.Checks[0].Error != "context canceled" || r.Checks[0].DurationMS != 0 || !r.Checks[0].Critical {
+			t.Fatalf("caller A report = %+v, want a synthesized down report", r)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("caller A did not return promptly after cancellation")
+	}
+
 	close(release)
-	wg.Wait()
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("calls = %d, want 1", got)
-	}
-	for i, r := range reports {
+	select {
+	case r := <-repB:
 		if r.Status != healthaggregator.StatusUp {
-			t.Fatalf("report %d status = %q", i, r.Status)
+			t.Fatalf("caller B Status = %q, want up", r.Status)
 		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("caller B did not receive the refresh")
+	}
+
+	if cached := a.Run(context.Background()); cached.Status != healthaggregator.StatusUp {
+		t.Fatalf("cached Status = %q, want up", cached.Status)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("Fn called %d times, want 1", n)
 	}
 }
 
-func TestCancelledParentFailsFast(t *testing.T) {
-	var calls int32
-	a := healthaggregator.New(config{ErrorDetails: true})
-	register(t, a, check{Name: "db", Fn: counting(&calls, nil), Critical: true}, check{Name: "cache", Fn: counting(&calls, nil)})
-	ctx, cancel := context.WithCancel(bg)
+func TestAbandonedReportHidesErrorByDefault(t *testing.T) {
+	var calls atomic.Int32
+	a := newAgg(t, config{}, check{Name: "db", Fn: blocker(t, &calls)})
+	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	got := a.Run(ctx)
-	if got.Status != healthaggregator.StatusDown {
-		t.Fatalf("Status = %q, want down", got.Status)
+	rep := a.Run(ctx)
+	if rep.Status != healthaggregator.StatusDown || rep.Checks[0].Error != "failed" {
+		t.Fatalf("report = %+v, want down with failed", rep)
 	}
-	if n := atomic.LoadInt32(&calls); n != 0 {
-		t.Fatalf("calls = %d, want 0", n)
-	}
-	for _, c := range got.Checks {
-		if c.Status != healthaggregator.StatusDown || c.Error != "context canceled" {
-			t.Fatalf("result = %+v", c)
+}
+
+func TestOnCheckMayCallRun(t *testing.T) {
+	var agg *healthaggregator.Aggregator
+	var reentered atomic.Bool
+	finished := make(chan struct{})
+	cfg := config{Now: newClock().Now, OnCheck: func(healthaggregator.CheckResult) {
+		if reentered.CompareAndSwap(false, true) {
+			agg.Run(context.Background())
+			close(finished)
 		}
+	}}
+	agg = healthaggregator.New(cfg)
+	if err := agg.Register(check{Name: "db", Fn: pass}); err != nil {
+		t.Fatalf("Register = %v", err)
+	}
+	agg.Run(context.Background())
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnCheck calling Run deadlocked")
 	}
 }
 
-func TestTimeoutSelection(t *testing.T) {
-	tests := []struct {
-		name    string
-		cfg     config
-		timeout time.Duration
-		min     time.Duration
-		max     time.Duration
-	}{
-		{name: "check timeout", cfg: config{}, timeout: 5 * time.Second, min: 3 * time.Second, max: 5 * time.Second},
-		{name: "config default", cfg: config{DefaultTimeout: 30 * time.Second}, min: 20 * time.Second, max: 30 * time.Second},
-		{name: "builtin default", cfg: config{}, min: time.Second, max: 2 * time.Second},
-		{name: "negative uses default", cfg: config{}, timeout: -1, min: time.Second, max: 2 * time.Second},
+func recv(t *testing.T, ch <-chan healthaggregator.CheckResult) healthaggregator.CheckResult {
+	t.Helper()
+	select {
+	case r := <-ch:
+		return r
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnCheck was not called")
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var remaining time.Duration
-			probe := func(ctx context.Context) error {
-				deadline, found := ctx.Deadline()
-				if !found {
-					return errors.New("no deadline")
-				}
-				remaining = time.Until(deadline)
-				return nil
-			}
-			a := healthaggregator.New(tt.cfg)
-			register(t, a, check{Name: "probe", Fn: probe, Timeout: tt.timeout})
-			if got := a.Run(bg); got.Status != healthaggregator.StatusUp {
-				t.Fatalf("Status = %q", got.Status)
-			}
-			if remaining <= tt.min || remaining > tt.max {
-				t.Fatalf("remaining = %v, want in (%v, %v]", remaining, tt.min, tt.max)
-			}
-		})
+	return healthaggregator.CheckResult{}
+}
+
+func TestOnCheckOrderAndSkips(t *testing.T) {
+	seen := make(chan healthaggregator.CheckResult, 8)
+	agg := newAgg(t, config{OnCheck: func(r healthaggregator.CheckResult) { seen <- r }}, check{Name: "b", Fn: pass}, check{Name: "a", Fn: failWith("x")})
+	agg.Run(context.Background())
+	first, second := recv(t, seen), recv(t, seen)
+	if first.Name != "a" || first.Status != healthaggregator.StatusDown || second.Name != "b" {
+		t.Fatalf("callbacks = %+v then %+v, want a (down) then b", first, second)
+	}
+
+	var calls atomic.Int32
+	seenSlow := make(chan healthaggregator.CheckResult, 8)
+	slow := newAgg(t, config{OnCheck: func(r healthaggregator.CheckResult) { seenSlow <- r }}, check{Name: "slow", Fn: blocker(t, &calls), Timeout: 20 * time.Millisecond})
+	slow.Run(context.Background())
+	recv(t, seenSlow)
+	slow.Run(context.Background())
+	if n := len(seenSlow); n != 0 {
+		t.Fatalf("OnCheck called for a skipped check (%d extra calls)", n)
 	}
 }
 
-func TestDurationAndCheckedAtUseInjectedClock(t *testing.T) {
+func TestOnCheckPanicIsContained(t *testing.T) {
+	called := make(chan struct{}, 4)
+	agg := newAgg(t, config{OnCheck: func(healthaggregator.CheckResult) {
+		called <- struct{}{}
+		panic("callback")
+	}}, check{Name: "db", Fn: pass})
+	agg.Run(context.Background())
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnCheck was not called")
+	}
+	if rep := agg.Run(context.Background()); rep.Status != healthaggregator.StatusUp {
+		t.Fatalf("Status = %q, want up", rep.Status)
+	}
+}
+
+func TestDurationMS(t *testing.T) {
 	clk := newClock()
-	start := clk.Now()
-	slow := func(context.Context) error {
+	slowFn := func(context.Context) error {
 		clk.Advance(150 * time.Millisecond)
 		return nil
 	}
-	a := healthaggregator.New(config{Now: clk.Now})
-	register(t, a, check{Name: "slow", Fn: slow})
-	got := a.Run(bg)
-	if !got.CheckedAt.Equal(start) {
-		t.Fatalf("CheckedAt = %v, want %v", got.CheckedAt, start)
-	}
-	if got.Checks[0].DurationMS != 150 {
-		t.Fatalf("DurationMS = %d, want 150", got.Checks[0].DurationMS)
-	}
-
-	backwards := func(context.Context) error {
-		clk.Advance(-time.Second)
+	backFn := func(context.Context) error {
+		clk.Advance(-5 * time.Second)
 		return nil
 	}
-	b := healthaggregator.New(config{Now: clk.Now})
-	register(t, b, check{Name: "back", Fn: backwards})
-	if d := b.Run(bg).Checks[0].DurationMS; d != 0 {
-		t.Fatalf("DurationMS = %d, want 0", d)
+	a := newAgg(t, config{Now: clk.Now}, check{Name: "slow", Fn: slowFn})
+	if got := a.Run(context.Background()).Checks[0].DurationMS; got != 150 {
+		t.Fatalf("DurationMS = %d, want 150", got)
+	}
+	b := newAgg(t, config{Now: clk.Now}, check{Name: "back", Fn: backFn})
+	if got := b.Run(context.Background()).Checks[0].DurationMS; got != 0 {
+		t.Fatalf("DurationMS = %d, want 0 for a backwards clock", got)
 	}
 }
 
-func TestOnCheck(t *testing.T) {
-	var seen []string
-	record := func(r healthaggregator.CheckResult) { seen = append(seen, r.Name) }
-	a := healthaggregator.New(config{OnCheck: record})
-	register(t, a, check{Name: "b", Fn: pass}, check{Name: "a", Fn: fail})
-	a.Run(bg)
-	if !slices.Equal(seen, []string{"a", "b"}) {
-		t.Fatalf("seen = %v", seen)
+func TestNewDefaults(t *testing.T) {
+	a := healthaggregator.New(healthaggregator.Config{})
+	if err := a.Register(check{Name: "db", Fn: pass}); err != nil {
+		t.Fatalf("Register = %v", err)
 	}
-
-	explode := func(healthaggregator.CheckResult) { panic("callback") }
-	b := healthaggregator.New(config{OnCheck: explode})
-	register(t, b, check{Name: "x", Fn: pass})
-	for range 2 {
-		if got := b.Run(bg); got.Status != healthaggregator.StatusUp {
-			t.Fatalf("Status = %q", got.Status)
-		}
+	rep := a.Run(context.Background())
+	if rep.Status != healthaggregator.StatusUp || rep.CheckedAt.IsZero() || rep.Checks[0].DurationMS < 0 {
+		t.Fatalf("report = %+v, want up with a real timestamp", rep)
 	}
 }
 
-func TestRegisterValidation(t *testing.T) {
+func TestRegisterErrors(t *testing.T) {
+	a := healthaggregator.New(config{})
+	if err := a.Register(check{Name: "db", Fn: pass}); err != nil {
+		t.Fatalf("Register(db) = %v", err)
+	}
 	tests := []struct {
-		name  string
-		check check
-		want  error
+		name string
+		in   check
+		want error
 	}{
-		{name: "valid", check: check{Name: "db", Fn: pass}},
-		{name: "unicode name", check: check{Name: "données", Fn: pass}},
-		{name: "max length", check: check{Name: strings.Repeat("a", 64), Fn: pass}},
-		{name: "unicode at limit", check: check{Name: strings.Repeat("é", 32), Fn: pass}},
-		{name: "empty", check: check{Fn: pass}, want: healthaggregator.ErrInvalidName},
-		{name: "too long", check: check{Name: strings.Repeat("a", 65), Fn: pass}, want: healthaggregator.ErrInvalidName},
-		{name: "unicode too long", check: check{Name: strings.Repeat("é", 33), Fn: pass}, want: healthaggregator.ErrInvalidName},
-		{name: "invalid utf8", check: check{Name: "a\xff", Fn: pass}, want: healthaggregator.ErrInvalidName},
-		{name: "nil func", check: check{Name: "x"}, want: healthaggregator.ErrInvalidCheck},
+		{name: "duplicate", in: check{Name: "db", Fn: pass}, want: healthaggregator.ErrDuplicateCheck},
+		{name: "empty name", in: check{Name: "", Fn: pass}, want: healthaggregator.ErrInvalidName},
+		{name: "65 byte name", in: check{Name: strings.Repeat("n", 65), Fn: pass}, want: healthaggregator.ErrInvalidName},
+		{name: "64 byte name", in: check{Name: strings.Repeat("n", 64), Fn: pass}, want: nil},
+		{name: "nil function", in: check{Name: "nofn"}, want: healthaggregator.ErrNilFunc},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			a := healthaggregator.New(config{})
-			if err := a.Register(tt.check); !errors.Is(err, tt.want) {
-				t.Fatalf("Register() = %v, want %v", err, tt.want)
+			if err := a.Register(tt.in); !errors.Is(err, tt.want) {
+				t.Fatalf("Register error = %v, want %v", err, tt.want)
 			}
 		})
 	}
 }
 
-func TestRegisterDuplicateAndLimit(t *testing.T) {
+func TestRegisterLimit(t *testing.T) {
 	a := healthaggregator.New(config{})
-	register(t, a, check{Name: "db", Fn: pass})
-	if err := a.Register(check{Name: "db", Fn: pass}); !errors.Is(err, healthaggregator.ErrDuplicateCheck) {
-		t.Fatalf("Register() = %v, want duplicate", err)
+	for i := 0; i < healthaggregator.MaxChecks; i++ {
+		if err := a.Register(check{Name: "c" + strconv.Itoa(i), Fn: pass}); err != nil {
+			t.Fatalf("Register #%d = %v", i, err)
+		}
 	}
-	full := healthaggregator.New(config{})
-	for i := range healthaggregator.MaxChecks {
-		register(t, full, check{Name: fmt.Sprintf("c%d", i), Fn: pass})
-	}
-	if err := full.Register(check{Name: "extra", Fn: pass}); !errors.Is(err, healthaggregator.ErrTooManyChecks) {
-		t.Fatalf("Register() = %v, want too many", err)
+	if err := a.Register(check{Name: "one-more", Fn: pass}); !errors.Is(err, healthaggregator.ErrTooManyChecks) {
+		t.Fatalf("Register over the limit = %v, want ErrTooManyChecks", err)
 	}
 }
 
-func TestErrorType(t *testing.T) {
-	tests := []struct {
-		err  *healthaggregator.Error
-		code string
-	}{
-		{err: healthaggregator.ErrDuplicateCheck, code: "duplicate_check"},
-		{err: healthaggregator.ErrInvalidName, code: "invalid_name"},
-		{err: healthaggregator.ErrInvalidCheck, code: "invalid_check"},
-		{err: healthaggregator.ErrTooManyChecks, code: "too_many_checks"},
+func TestErrorValues(t *testing.T) {
+	err := healthaggregator.New(config{}).Register(check{Name: "", Fn: pass})
+	var typed *healthaggregator.Error
+	if !errors.As(err, &typed) || typed.Code != "invalid_name" {
+		t.Fatalf("error = %v, want *Error with code invalid_name", err)
 	}
-	for _, tt := range tests {
-		var target *healthaggregator.Error
-		wrapped := fmt.Errorf("wrap: %w", tt.err)
-		if !errors.As(wrapped, &target) || target.Code != tt.code {
-			t.Fatalf("code for %v = %v, want %q", tt.err, target, tt.code)
-		}
-		if !strings.HasPrefix(tt.err.Error(), "healthaggregator: ") {
-			t.Fatalf("message = %q", tt.err.Error())
+	if !strings.HasPrefix(err.Error(), "healthaggregator: ") {
+		t.Fatalf("Error() = %q, want the package prefix", err.Error())
+	}
+	codes := map[string]*healthaggregator.Error{"duplicate_check": healthaggregator.ErrDuplicateCheck, "nil_func": healthaggregator.ErrNilFunc, "too_many_checks": healthaggregator.ErrTooManyChecks}
+	for code, e := range codes {
+		if e.Code != code {
+			t.Fatalf("Code = %q, want %q", e.Code, code)
 		}
 	}
 }
 
-func TestHandlerStatusCodes(t *testing.T) {
+func serve(a *healthaggregator.Aggregator, method string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, "/health", nil)
+	rec := httptest.NewRecorder()
+	a.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+func TestHandlerStatusCodesAndHeaders(t *testing.T) {
 	tests := []struct {
 		name   string
 		checks []check
 		code   int
-		status healthaggregator.Status
 	}{
-		{name: "up", checks: []check{{Name: "db", Fn: pass, Critical: true}}, code: 200, status: healthaggregator.StatusUp},
-		{name: "degraded", checks: []check{{Name: "cache", Fn: fail}}, code: 200, status: healthaggregator.StatusDegraded},
-		{name: "down", checks: []check{{Name: "db", Fn: fail, Critical: true}}, code: 503, status: healthaggregator.StatusDown},
+		{name: "up", checks: []check{{Name: "db", Fn: pass, Critical: true}}, code: http.StatusOK},
+		{name: "degraded", checks: []check{{Name: "cache", Fn: failWith("x")}}, code: http.StatusOK},
+		{name: "down", checks: []check{{Name: "db", Fn: failWith("x"), Critical: true}}, code: http.StatusServiceUnavailable},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			a := healthaggregator.New(config{})
-			register(t, a, tt.checks...)
+			a := newAgg(t, config{}, tt.checks...)
 			for _, method := range []string{http.MethodGet, http.MethodHead} {
 				rec := serve(a, method)
 				if rec.Code != tt.code {
 					t.Fatalf("%s code = %d, want %d", method, rec.Code, tt.code)
 				}
-				if got := rec.Header().Get("Content-Type"); got != "application/json" {
-					t.Fatalf("Content-Type = %q", got)
-				}
-				if got := rec.Header().Get("Cache-Control"); got != "no-store" {
-					t.Fatalf("Cache-Control = %q", got)
-				}
-				if method == http.MethodHead {
-					if rec.Body.Len() != 0 {
-						t.Fatalf("HEAD body = %q", rec.Body.String())
+				wantHeaders := map[string]string{"Content-Type": "application/json", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+				for k, v := range wantHeaders {
+					if got := rec.Header().Get(k); got != v {
+						t.Fatalf("%s header %s = %q, want %q", method, k, got, v)
 					}
-					continue
 				}
-				var rep healthaggregator.Report
-				if err := json.Unmarshal(rec.Body.Bytes(), &rep); err != nil {
-					t.Fatalf("invalid JSON: %v", err)
+				if method == http.MethodHead && rec.Body.Len() != 0 {
+					t.Fatalf("HEAD body = %q, want empty", rec.Body.String())
 				}
-				if rep.Status != tt.status {
-					t.Fatalf("status = %q, want %q", rep.Status, tt.status)
+				if method == http.MethodGet && rec.Body.Len() == 0 {
+					t.Fatal("GET body is empty")
 				}
 			}
 		})
 	}
 }
 
-func TestHandlerRejectsOtherMethods(t *testing.T) {
-	var calls int32
-	a := healthaggregator.New(config{})
-	register(t, a, check{Name: "db", Fn: counting(&calls, nil)})
+func TestHandlerMethodNotAllowed(t *testing.T) {
+	a := newAgg(t, config{}, check{Name: "db", Fn: pass})
 	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
 		rec := serve(a, method)
-		if rec.Code != http.StatusMethodNotAllowed {
-			t.Fatalf("%s code = %d", method, rec.Code)
+		if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "GET, HEAD" {
+			t.Fatalf("%s = %d Allow %q, want 405 GET, HEAD", method, rec.Code, rec.Header().Get("Allow"))
 		}
-		if got := rec.Header().Get("Allow"); got != "GET, HEAD" {
-			t.Fatalf("Allow = %q", got)
-		}
-	}
-	if n := atomic.LoadInt32(&calls); n != 0 {
-		t.Fatalf("calls = %d, want 0", n)
-	}
-}
-
-func TestHandlerJSONShape(t *testing.T) {
-	clk := newClock()
-	a := healthaggregator.New(config{Now: clk.Now, ErrorDetails: true})
-	register(t, a, check{Name: "ok", Fn: pass, Critical: true}, check{Name: "bad", Fn: fail})
-	rec := serve(a, http.MethodGet)
-	var top map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &top); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-	if got := keys(top); !slices.Equal(got, []string{"checked_at", "checks", "status"}) {
-		t.Fatalf("top keys = %v", got)
-	}
-	if top["checked_at"] != "2024-01-02T03:04:05Z" {
-		t.Fatalf("checked_at = %v", top["checked_at"])
-	}
-	items, isList := top["checks"].([]any)
-	if !isList || len(items) != 2 {
-		t.Fatalf("checks = %v", top["checks"])
-	}
-	bad, _ := items[0].(map[string]any)
-	good, _ := items[1].(map[string]any)
-	if got := keys(bad); !slices.Equal(got, []string{"critical", "duration_ms", "error", "name", "status"}) {
-		t.Fatalf("failing keys = %v", got)
-	}
-	if got := keys(good); !slices.Equal(got, []string{"critical", "duration_ms", "name", "status"}) {
-		t.Fatalf("passing keys = %v", got)
-	}
-	if bad["error"] != "boom" {
-		t.Fatalf("error = %v", bad["error"])
-	}
-}
-
-func TestHandlerHidesErrorDetailsByDefault(t *testing.T) {
-	leaky := func(context.Context) error {
-		return errors.New("dial tcp 10.0.0.5:5432: password authentication failed for user admin")
-	}
-	for _, details := range []bool{false, true} {
-		a := healthaggregator.New(config{ErrorDetails: details})
-		register(t, a, check{Name: "db", Fn: leaky, Critical: true})
-		body := serve(a, http.MethodGet).Body.String()
-		if leaked := strings.Contains(body, "10.0.0.5"); leaked != details {
-			t.Fatalf("details=%v leaked=%v body=%s", details, leaked, body)
-		}
-		if !details && !strings.Contains(body, `"error":"failed"`) {
-			t.Fatalf("body = %s", body)
+		if rec.Body.Len() != 0 {
+			t.Fatalf("%s body = %q, want empty", method, rec.Body.String())
 		}
 	}
 }
 
-func TestHandlerUsesRequestContext(t *testing.T) {
-	var calls int32
-	a := healthaggregator.New(config{})
-	register(t, a, check{Name: "db", Fn: counting(&calls, nil), Critical: true})
-	ctx, cancel := context.WithCancel(bg)
+func TestHandlerExactBody(t *testing.T) {
+	a := newAgg(t, config{Now: newClock().Now}, check{Name: "db", Fn: pass, Critical: true})
+	want := `{"status":"up","checked_at":"2026-01-02T03:04:05Z","checks":[{"name":"db","status":"up","duration_ms":0,"critical":true}]}` + "\n"
+	if got := serve(a, http.MethodGet).Body.String(); got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+
+	empty := newAgg(t, config{Now: newClock().Now})
+	wantEmpty := `{"status":"up","checked_at":"2026-01-02T03:04:05Z","checks":[]}` + "\n"
+	if got := serve(empty, http.MethodGet).Body.String(); got != wantEmpty {
+		t.Fatalf("empty body = %q, want %q", got, wantEmpty)
+	}
+}
+
+func TestHandlerHidesInternalErrors(t *testing.T) {
+	fn := failWith("dial tcp 10.0.0.5:5432: connection refused")
+	hidden := newAgg(t, config{}, check{Name: "db", Fn: fn, Critical: true})
+	body := serve(hidden, http.MethodGet).Body.String()
+	if strings.Contains(body, "10.0.0.5") || strings.Contains(body, "refused") || !strings.Contains(body, `"error":"failed"`) {
+		t.Fatalf("body leaks internal error text or lacks the generic one: %s", body)
+	}
+
+	shown := newAgg(t, config{ErrorDetails: true}, check{Name: "db", Fn: fn, Critical: true})
+	if body := serve(shown, http.MethodGet).Body.String(); !strings.Contains(body, "10.0.0.5") {
+		t.Fatalf("body with ErrorDetails lacks the error text: %s", body)
+	}
+}
+
+func TestHandlerCanceledRequest(t *testing.T) {
+	var calls atomic.Int32
+	a := newAgg(t, config{}, check{Name: "db", Fn: blocker(t, &calls), Critical: true})
+	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	req := httptest.NewRequest(http.MethodGet, "/health", nil).WithContext(ctx)
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
 	a.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("code = %d, want 503", rec.Code)
-	}
-	if n := atomic.LoadInt32(&calls); n != 0 {
-		t.Fatalf("calls = %d, want 0", n)
-	}
-}
-
-func TestConcurrentRegisterAndRun(t *testing.T) {
-	a := healthaggregator.New(config{CacheTTL: time.Millisecond})
-	var wg sync.WaitGroup
-	for i := range 20 {
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			_ = a.Register(check{Name: fmt.Sprintf("c%02d", i), Fn: pass})
-		}()
-		go func() {
-			defer wg.Done()
-			_ = a.Run(bg)
-		}()
-	}
-	wg.Wait()
-	if got := a.Run(bg); len(got.Checks) != 20 {
-		t.Fatalf("len(Checks) = %d, want 20", len(got.Checks))
 	}
 }

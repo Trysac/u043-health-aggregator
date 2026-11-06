@@ -9,9 +9,5 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Add `healthaggregator`: concurrent health checks with per-check timeouts, critical versus optional checks, an up/degraded/down status, TTL caching with single flight and a redacting HTTP handler.
-
-
-### Added
-
+- Add the `healthaggregator` package: concurrent health checks with per-check timeouts, critical versus optional checks, up/degraded/down aggregation, TTL caching with a shared single-flight refresh, and an HTTP handler that hides internal error text by default.
 - Initial project structure from the factory utility template.
